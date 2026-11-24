@@ -464,6 +464,8 @@ fn recheck_source(e: &mut Entry) -> bool {
 /// by the GPU). The first upload, if still pending, stays: it runs before the title's submit
 /// that copies.
 pub fn note_gpu_write(res: usize) {
+    #[cfg(test)]
+    NOTE_GPU_WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
     let mut marked = false;
     {
         let mut t = TEXTURES.lock().unwrap();
@@ -481,6 +483,10 @@ pub fn note_gpu_write(res: usize) {
 }
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// `note_gpu_write` calls (a list's hooks that must mark a write count them: a resolve did).
+#[cfg(test)]
+pub(super) static NOTE_GPU_WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
