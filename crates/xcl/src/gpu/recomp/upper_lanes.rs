@@ -546,8 +546,8 @@ fn step(d: &Decoded, st: &mut State) {
     let name = d.inst.name;
     let fv = |f: &str| rdna2::field_value(d.enc, &d.words, f).unwrap_or(0);
     let exec_hi = st.s[127];
-    if name.starts_with("S_MOVRELD") {
-        // writes s[dst + m0]: any SGPR
+    if name.starts_with("S_MOVRELD") || name == "S_MOVRELSD_2_B32" {
+        // writes s[dst + m0] (`s_movrelsd_2_b32`: s[dst + m0[25:16]]): any SGPR
         st.s = [Word::Any; 128];
         st.s[125] = Word::Zero;
         st.s[127] = exec_hi;
@@ -922,6 +922,33 @@ mod tests {
         // native read, not listed), lane 36 still the spill
         assert_eq!(r, vec![Read::Shadow, Read::Shadow, Read::Native, Read::Shadow]);
         assert_eq!(a.shadows, BTreeSet::from([(96, 5), (96, 36)]));
+    }
+
+    #[test]
+    fn movrelsd_writes_a_register_its_dst_field_does_not_name() {
+        // s_movrelsd_2_b32 writes s[dst + m0[25:16]] from s[src + m0[9:0]]: with m0 = 0x10000
+        // that is s11 from s20, not s10 (the SDST field) – s11's constant is gone
+        let r = reads(&[
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None), // EXEC = -1
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),  // s11 = 0
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(0x10000)), // m0: dst + 1, src + 0
+            ("S_MOVRELSD_2_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 20)], None), // s11 = s20
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 55), ("SRC0", 11)], None), // v55 = s11
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 55), ("SRC1", 128 + 32)], None),
+        ]);
+        assert_eq!(r, vec![Read::Unknown], "s11 must not keep its constant through s[dst + m0[25:16]]");
+
+        // (as s_movreld_b32, whose offset is m0 itself and which the analysis already treats
+        // as writing any SGPR)
+        let r = reads(&[
+            ("S_MOV_B64", "ENC_SOP1", &[("SDST", 126), ("SSRC0", 193)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 11), ("SSRC0", 128)], None),
+            ("S_MOV_B32", "ENC_SOP1", &[("SDST", 124), ("SSRC0", 255)], Some(1)),
+            ("S_MOVRELD_B32", "ENC_SOP1", &[("SDST", 10), ("SSRC0", 20)], None),
+            ("V_MOV_B32", "ENC_VOP1", &[("VDST", 55), ("SRC0", 11)], None),
+            ("V_READLANE_B32", "ENC_VOP3", &[("VDST", 10), ("SRC0", V + 55), ("SRC1", 128 + 32)], None),
+        ]);
+        assert_eq!(r, vec![Read::Unknown], "s_movreld_b32 writes s[dst + m0] the same way");
     }
 
     #[test]
