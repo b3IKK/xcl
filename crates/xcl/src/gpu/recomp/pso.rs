@@ -153,17 +153,21 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one().map(|(c, _)| c);
     }
+    // (a device without 64-bit typed atomics refuses the programs that use them: part of both
+    // caches' keys, so its entries are never a capable device's)
+    let int64_typed_atomic = int64_typed_atomic();
     let key = ShaderKey {
         hash: crate::gpu::shader::fnv64(blob),
         stage,
         sampler_base,
         windows,
         split_wave64,
+        int64_typed_atomic,
         cache_dir: dxc::cache_dir(),
     };
     // with `XCL_DIRECT_DXIL` the disk entries live under their own identity (backend tag,
     // direct translator version, routing mode): never mixed with the HLSL path's entries
-    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let from_disk = || translated::cached(&dxc::cache_dir(), int64_typed_atomic, blob, stage, sampler_base, windows, split_wave64, compile_one);
     cached_shader(shader_cache(), key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
@@ -235,6 +239,16 @@ mod translated {
             }
         }
         h | 1
+    }
+
+    /// `ident` for a device with (`int64_typed_atomic`) or without 64-bit atomics on typed
+    /// resources: unchanged with them (its entries stay valid), an identity of its own without –
+    /// such a device refuses the programs that use them, whose DXIL a capable one keeps.
+    pub(super) fn identity_for_caps(ident: u64, int64_typed_atomic: bool) -> u64 {
+        if ident == 0 || int64_typed_atomic {
+            return ident;
+        }
+        identity_for(&ident.to_string(), "xcl-no-int64-typed-atomics")
     }
 
     /// Translation semantics and the DXC DLLs, independent of link metadata and build profile.
@@ -370,6 +384,7 @@ mod translated {
     /// follows that translator's version: the HLSL path's identity does not.
     pub(super) fn cached(
         dir: &Path,
+        int64_typed_atomic: bool,
         blob: &[u8],
         stage: Stage,
         sampler_base: u32,
@@ -377,7 +392,7 @@ mod translated {
         split: bool,
         translate: impl FnOnce() -> Result<(Compiled, bool), String>,
     ) -> Result<Compiled, String> {
-        cached_rerouted(dir, identity(), direct_output(), blob, stage, sampler_base, windows, split, translate)
+        cached_rerouted(dir, identity_for_caps(identity(), int64_typed_atomic), direct_output(), blob, stage, sampler_base, windows, split, translate)
     }
 
     /// What the direct translator's output depends on besides the HLSL path's identity: its
@@ -595,6 +610,7 @@ struct ShaderKey {
     sampler_base: u32,
     windows: u32,
     split_wave64: bool,
+    int64_typed_atomic: bool,
     cache_dir: PathBuf,
 }
 
@@ -880,7 +896,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
             return Err("an FSPX (driver) container in a graphics slot".into());
         }
         let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
-        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, int64_typed_atomic: int64_typed_atomic(), ..Default::default() })?;
         if !t.complete() {
             let missing: Vec<&String> = t.unsupported.keys().collect();
             return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -909,7 +925,7 @@ pub(crate) fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, 
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, int64_typed_atomic: int64_typed_atomic(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
@@ -1014,9 +1030,10 @@ fn console_mesh_with(
             sampler_base: 0,
             windows,
             split_wave64: split,
+            int64_typed_atomic: int64_typed_atomic(),
             cache_dir: cache_dir.to_path_buf(),
         };
-        let from_disk = || translated::cached(cache_dir, blob, Stage::Mesh, 0, windows, split, || compile_one().map(|c| (c, false)));
+        let from_disk = || translated::cached(cache_dir, int64_typed_atomic(), blob, Stage::Mesh, 0, windows, split, || compile_one().map(|c| (c, false)));
         cached_shader(cache, key, blob, from_disk)?.as_ref().clone()
     } else {
         compile_one()?
@@ -1067,6 +1084,45 @@ fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
     }
     .ok()
     .map(|_| (options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+/// Whether the device supports SM 6.6 64-bit integer atomics on typed UAVs accessed through
+/// `ResourceDescriptorHeap` (`OPTIONS9::AtomicInt64OnTypedResourceSupported` and
+/// `OPTIONS11::AtomicInt64OnDescriptorHeapResourceSupported`).
+pub fn int64_typed_atomic_for_device(device: &ID3D12Device) -> bool {
+    let mut o9 = D3D12_FEATURE_DATA_D3D12_OPTIONS9::default();
+    let mut o11 = D3D12_FEATURE_DATA_D3D12_OPTIONS11::default();
+    unsafe {
+        device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS9, &mut o9 as *mut _ as _, std::mem::size_of_val(&o9) as u32)
+            .is_ok()
+            && o9.AtomicInt64OnTypedResourceSupported.as_bool()
+            && device
+                .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS11, &mut o11 as *mut _ as _, std::mem::size_of_val(&o11) as u32)
+                .is_ok()
+            && o11.AtomicInt64OnDescriptorHeapResourceSupported.as_bool()
+    }
+}
+
+/// Whether the active runtime D3D12 device supports 64-bit typed image atomics through
+/// `ResourceDescriptorHeap`. Defaults to `true` when no runtime device exists (CLI / offline).
+pub fn int64_typed_atomic() -> bool {
+    // (asked for every translation: the device is asked once it exists; 0 = not asked yet)
+    static KNOWN: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+    match KNOWN.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => {}
+        known => return known == 2,
+    }
+    let raw = crate::hle::d3d12x::real::device_raw();
+    if raw.is_null() {
+        return true;
+    }
+    let supported = unsafe {
+        let dev: Option<&ID3D12Device> = windows::core::Interface::from_raw_borrowed(&raw);
+        dev.is_none_or(int64_typed_atomic_for_device)
+    };
+    KNOWN.store(1 + supported as u8, std::sync::atomic::Ordering::Relaxed);
+    supported
 }
 
 pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
@@ -1374,6 +1430,39 @@ mod shader_cache_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A device without 64-bit typed atomics keeps its translations too, under an identity of
+    /// its own: it neither loads the DXIL a capable device made of a program that uses them,
+    /// nor translates every program again at each start. A capable device's identity (and so
+    /// its existing entries) is unchanged.
+    #[test]
+    fn a_device_without_int64_typed_atomics_has_its_own_disk_entries() {
+        use translated::{cached_in, identity_for, identity_for_caps};
+        let ident = identity_for("s", "t");
+        let without = identity_for_caps(ident, false);
+        assert_eq!(identity_for_caps(ident, true), ident, "entries of a capable device stay valid");
+        assert!(without != ident && without != 0);
+        assert_eq!(identity_for_caps(0, false), 0, "a disabled cache stays disabled");
+
+        let dir = std::env::temp_dir().join(format!("xcl-translated-int64-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console-int64";
+        let go = |ident, marker: u8, calls: &mut u32| {
+            cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+                *calls += 1;
+                Ok(compiled(marker))
+            })
+            .unwrap()
+            .dxil[67]
+        };
+        let mut calls = 0;
+        assert_eq!(go(ident, 1, &mut calls), 1);
+        assert_eq!(go(without, 2, &mut calls), 2, "the capable device's entry is not this device's");
+        assert_eq!(go(without, 9, &mut calls), 2, "its own entry is reused");
+        assert_eq!(go(ident, 9, &mut calls), 1, "and the capable device's is left alone");
+        assert_eq!(calls, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn key(hash: u64) -> ShaderKey {
         ShaderKey {
             hash,
@@ -1381,6 +1470,7 @@ mod shader_cache_tests {
             sampler_base: 0,
             windows: 1,
             split_wave64: false,
+            int64_typed_atomic: true,
             cache_dir: "cache".into(),
         }
     }
@@ -1526,6 +1616,10 @@ mod shader_cache_tests {
             },
             ShaderKey {
                 windows: 2,
+                ..original.clone()
+            },
+            ShaderKey {
+                int64_typed_atomic: false,
                 ..original.clone()
             },
             ShaderKey {
