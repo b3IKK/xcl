@@ -751,20 +751,30 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             ctrl[v].push(a);
         }
     }
+    /// A store into a root (a global or groupshared array): the value written, the pointer it
+    /// went through (an index built from an input) and the block (a store under a branch
+    /// depends on that branch's inputs) – a later load of the root depends on all three.
+    struct Stored {
+        v: Value,
+        p: Value,
+        block: usize,
+    }
     // Instruction → block.
     let mut block_of: HashMap<u32, usize> = HashMap::new();
-    let mut root_stores: HashMap<Value, Vec<Value>> = HashMap::new();
+    let mut root_stores: HashMap<Value, Vec<Stored>> = HashMap::new();
     for b in 0..nb {
         for &i in m.block_insts(Block(b as u32)) {
             block_of.insert(i, b);
             if let InstInfo::Store(p, v) = m.inst_info(i) {
-                root_stores.entry(root(s, p)).or_default().push(v);
+                root_stores.entry(root(s, p)).or_default().push(Stored { v, p, block: b });
             }
             if let InstInfo::Other(ops) = m.inst_info(i) {
                 // atomics write memory too
                 if ops.len() >= 2 {
                     if let Value::Global(_) = root(s, ops[0]) {
-                        root_stores.entry(root(s, ops[0])).or_default().extend_from_slice(&ops[1..]);
+                        for &v in &ops[1..] {
+                            root_stores.entry(root(s, ops[0])).or_default().push(Stored { v, p: ops[0], block: b });
+                        }
                     }
                 }
             }
@@ -820,7 +830,7 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
         block_of: &'a HashMap<u32, usize>,
         ctrl: &'a Vec<Vec<usize>>,
         cond: &'a Vec<Option<Value>>,
-        root_stores: &'a HashMap<Value, Vec<Value>>,
+        root_stores: &'a HashMap<Value, Vec<Stored>>,
         in_base: &'a [Option<u32>],
         inputs: &'a [Placed],
     }
@@ -883,8 +893,12 @@ fn compute_deps(s: &Shader, inputs: &[Placed], outputs: &[Placed], prims: &[Plac
             InstInfo::Load(p) => {
                 d.extend(value_deps(cx, p, st));
                 if let Some(vs) = cx.root_stores.get(&root(cx.s, p)) {
-                    for &x in vs {
-                        d.extend(value_deps(cx, x, st));
+                    for x in vs {
+                        // what was written, the index it was written through (the load may
+                        // read a slot the input chose) and the branch that guarded the store
+                        d.extend(value_deps(cx, x.v, st));
+                        d.extend(value_deps(cx, x.p, st));
+                        d.extend(block_deps(cx, x.block, st));
                     }
                 }
             }

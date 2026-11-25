@@ -695,6 +695,51 @@ fn vs_control_dependence_matches_dxc() {
     assert_valid(&c);
 }
 
+/// A load of a root depends on how the stores into it were reached, not only on what they
+/// wrote (#1892, its second point): the branch condition guarding a store and the index the
+/// store was made through are inputs the outputs depend on, and `dx.viewIdState` has to say so.
+#[test]
+fn a_load_depends_on_the_branch_and_the_index_of_the_stores_into_it() {
+    let mut s = Shader::new(Stage::Vertex, (6, 6));
+    let mut io = GraphicsIo::new(Stage::Vertex);
+    let c = io.input(SigElement::user("C", 0, CompType::U32, 1)); // the branch condition
+    let i = io.input(SigElement::user("I", 0, CompType::U32, 1)); // the index
+    let x = io.input(SigElement::user("X", 0, CompType::F32, 1)); // the value stored
+    let oa = io.output(SigElement::user("A", 0, CompType::F32, 1));
+    let f32t = s.m.f32();
+    let arr = s.m.array(2, f32t);
+    let g = s.m.global("g", arr, 3, None, false, 4);
+    let cv = io.load_input(&mut s, c, 0, 0);
+    let iv = io.load_input(&mut s, i, 0, 0);
+    let xv = io.load_input(&mut s, x, 0, 0);
+    let (c0, c1) = (s.m.i32c(0), s.m.i32c(1));
+    let one = f(&mut s, 1.0);
+    let idx = s.m.bin(BinOp::And, iv, c1);
+    let p = s.m.gep(g, &[c0, idx]);
+    // `if (C != 0) g[I & 1] = X;` then `if (C == 0) g[0] = 1.0;` – both stores guarded by C
+    let nz = s.m.cmp(Pred::Ne, cv, c0);
+    let (st, else_b, join) = (s.m.new_block(), s.m.new_block(), s.m.new_block());
+    s.m.cond_br(nz, st, else_b);
+    s.m.set_block(st);
+    s.m.store(p, xv, 4);
+    s.m.br(join);
+    s.m.set_block(else_b);
+    let p0 = s.m.gep(g, &[c0, c0]);
+    s.m.store(p0, one, 4);
+    s.m.br(join);
+    s.m.set_block(join);
+    let a = s.m.load(p0, 4);
+    io.store_output(&mut s, oa, 0, 0, a);
+    s.m.ret();
+    let (ins, outs, prims) = (io.place(Dir::In), io.place(Dir::Out), io.place(Dir::Prim));
+    let component = |p: &[Placed], sig: Sig| p[sig.id as usize].at.map(|(r, c)| r * 4 + c as u32).expect("a placed element");
+    let deps = compute_deps(&s, &ins, &outs, &prims);
+    let d = deps.out.get(&(0, component(&outs, oa))).cloned().unwrap_or_default();
+    for (name, sig) in [("C (the branch that guards the stores)", c), ("I (the index a store was made through)", i), ("X (the value stored)", x)] {
+        assert!(d.contains(&component(&ins, sig)), "the output depends on {name}; its inputs: {d:?}");
+    }
+}
+
 /// A value of a loop depends on what the loop's phi depends on, also when it is first reached
 /// through that phi (#1892): `acc = phi [X, entry], [next, loop]`, `next = acc + 1`, and the
 /// outputs A = acc, B = next. Asking for `acc` reaches `next` while `acc` is still being worked
