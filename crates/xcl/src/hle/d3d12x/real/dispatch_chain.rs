@@ -86,7 +86,12 @@ impl Chain {
             WHOLES_ASKED.fetch_add(1, Ordering::Relaxed);
         }
         let key = self.key();
-        let mut p = pso_async::resolve_wait_for(key, budget);
+        let mut p = match budget {
+            // a bind's budget: the bind may go on without it (`Whole::Building`)
+            Some(budget) => pso_async::resolve_wait_for(key, Some(budget)),
+            // the default: the title waits, but a worker builds it (never this thread)
+            None => pso_async::resolve_wait_worker(key),
+        };
         if p == key && pso_async::is_pending(key) {
             WHOLE_SKIPS.fetch_add(1, Ordering::Relaxed);
             return Ok(Whole::Building);
@@ -395,6 +400,66 @@ mod whole_tests {
             }
             assert!(matches!(super::whole(first), Ok(Whole::Built(_))), "built: an ExecuteIndirect gets it");
             assert!(matches!(super::whole(0x7E57_C4A3), Ok(Whole::NotSplit)));
+            assert_eq!(refs(&whole), 2, "this test's and the build's");
+            forget(first);
+            assert_eq!(refs(&whole), 1, "forget released the whole form");
+            assert_eq!(pso_async::resolve(chain.key()), chain.key(), "forgotten by pso_async too");
+        }
+    }
+
+    /// With no budget (`XCL_PSO_WAIT_MS` unset) the whole form is enqueued on a worker and the
+    /// asking thread waits for it: the build runs on `xcl-pso`, the result is `Whole::Built` and
+    /// the dispatch is not skipped.
+    #[test]
+    fn a_whole_form_with_no_budget_is_built_on_a_worker_and_not_skipped() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let warp = CreateDXGIFactory1::<IDXGIFactory4>().and_then(|f| f.EnumWarpAdapter::<IDXGIAdapter>());
+                if let Ok(warp) = warp {
+                    let _ = D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev);
+                }
+            }
+            let Some(dev) = dev else { return crate::gpu::recomp::runner::skip_test("no D3D12 device") };
+            let mut ser = None;
+            D3D12SerializeRootSignature(&D3D12_ROOT_SIGNATURE_DESC::default(), D3D_ROOT_SIGNATURE_VERSION_1, &mut ser, None).expect("serialize RS");
+            let ser = ser.unwrap();
+            let rs: ID3D12RootSignature = dev
+                .CreateRootSignature(0, std::slice::from_raw_parts(ser.GetBufferPointer() as *const u8, ser.GetBufferSize()))
+                .expect("CreateRootSignature");
+            let cs = dummy_cs_bytecode();
+            let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr() as *const c_void, BytecodeLength: cs.len() },
+                ..Default::default()
+            };
+            let whole: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).expect("CreateComputePipelineState");
+            std::mem::ManuallyDrop::drop(&mut desc.pRootSignature);
+
+            let builder = Arc::new(PipelineBuilder { device: dev.clone(), create: no_create, signature: rs, flags: Default::default(), node: 0, record: 0 });
+            let chain = Arc::new(Chain { builder, tail: Vec::new(), words: 1, asked: Default::default() });
+            let (started_tx, started) = mpsc::channel();
+            let (go, finish) = mpsc::channel::<()>();
+            let built = whole.clone().into_raw() as usize;
+            chain.queue_whole(Box::new(move || {
+                let _ = started_tx.send(std::thread::current().name().map(str::to_owned));
+                let _ = finish.recv();
+                built
+            }), false);
+            let first = 0x7E57_C4A2usize;
+            CHAINS.lock().unwrap().insert(first, chain.clone());
+            let before = WHOLE_SKIPS.load(Ordering::Relaxed);
+
+            let asking = chain.clone();
+            let asked = std::thread::spawn(move || asking.whole(None));
+            let builder_thread = started.recv_timeout(Duration::from_secs(10)).expect("a worker builds the whole form");
+            assert!(builder_thread.as_deref().is_some_and(|n| n.starts_with("xcl-pso")), "built on {builder_thread:?}, not on a PSO worker");
+            go.send(()).unwrap();
+            match asked.join().unwrap() {
+                Ok(Whole::Built(p)) => assert_eq!(p.as_raw(), whole.as_raw()),
+                _ => panic!("the whole form was built, but not handed out"),
+            }
+            assert_eq!(WHOLE_SKIPS.load(Ordering::Relaxed), before, "no dispatch was skipped");
             assert_eq!(refs(&whole), 2, "this test's and the build's");
             forget(first);
             assert_eq!(refs(&whole), 1, "forget released the whole form");

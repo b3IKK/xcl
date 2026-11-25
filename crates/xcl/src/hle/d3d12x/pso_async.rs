@@ -883,6 +883,31 @@ pub(super) fn resolve_wait_for(pso: usize, budget: Option<std::time::Duration>) 
     }
 }
 
+/// `resolve_wait` with no budget, with the build sent to the workers and waited for there: the
+/// calling (title) thread never takes the job. For a split program's whole form, which is a huge
+/// compile that must not run on a title thread (a `xcl-pso` worker takes a huge-build slot).
+pub(super) fn resolve_wait_worker(pso: usize) -> usize {
+    let Some(p) = entry(pso) else { return pso };
+    p.note_use();
+    if p.spared.load(Ordering::Acquire) {
+        return resolve_spared(&p, pso);
+    }
+    // (the title's thread is held until the worker has built it)
+    let _held = (!*p.done.lock().unwrap()).then(Held::new);
+    if !p.sent.swap(true, Ordering::AcqRel) {
+        enqueue(p.clone());
+    }
+    p.want();
+    let mut done = p.done.lock().unwrap();
+    while !*done {
+        done = p.cv.wait(done).unwrap();
+    }
+    match p.real.load(Ordering::Acquire) {
+        0 => p.stand(pso),
+        r => r,
+    }
+}
+
 /// How long a bind waits for a pipeline still being built (`XCL_PSO_WAIT_MS`; unset or 0: until
 /// it is built). A retail game builds compute programs on its own threads: the driver takes up to
 /// 30 s for the biggest translated ones, and the title's watchdog ends it when its main thread
