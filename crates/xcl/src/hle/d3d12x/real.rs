@@ -5448,6 +5448,12 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    // A compute pipeline whose first shader container is this big is one of the ~250 a retail load
+    // creates them by 10 s and first binds at ~91 s: start its build with the low-priority preload
+    // workers now. Smaller ones compile in milliseconds and would flood that queue.
+
+    const AHEAD_BLOB: usize = 64 << 10;
+    let ahead = compute && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| b.len() >= AHEAD_BLOB));
     // a big compute program that writes nothing but images: binds can go on without it
     let image_only = compute && super::pso_async::image_skip() && matches!(&owned, OwnedDesc::Compute(_, b) if b.first().is_some_and(|b| crate::gpu::effects::big_and_image_only(b)));
     let job: super::pso_async::Job = Box::new(move || {
@@ -5459,7 +5465,11 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        if ahead {
+            super::pso_async::submit_ahead(*ppv as usize, compute, job, key);
+        } else {
+            super::pso_async::submit_lazy(*ppv as usize, compute, job, key);
+        }
     } else {
         super::pso_async::submit(*ppv as usize, compute, job);
     }

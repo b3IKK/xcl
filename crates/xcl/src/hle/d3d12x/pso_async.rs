@@ -325,7 +325,7 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0);
+    submit_as(standin, compute, job, true, 0, false);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -341,10 +341,18 @@ pub fn lazy() -> bool {
 /// `submit`, sent to the workers only on its first `resolve` (`lazy`) – or now, at a low
 /// priority, when an earlier run used a pipeline of these shaders (`key`, 0 = none; `used`).
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key);
+    submit_as(standin, compute, job, false, key, false);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
+/// A big compute pipeline the title is expected to bind later in the same load (it creates its
+/// compute PSOs at ~5 s and first binds them at ~91 s): built now on the lowest-priority workers,
+/// so the bind finds it built. A bind that reaches one not started takes the job itself, as with
+/// `submit_lazy`; `XCL_PSO_PRELOAD=0` turns the ahead builds off.
+pub fn submit_ahead(standin: usize, compute: bool, job: Job, key: u64) {
+    submit_as(standin, compute, job, false, key, true);
+}
+
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, ahead: bool) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(job)),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -366,7 +374,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64) {
     });
     if send {
         enqueue(p);
-    } else if used::known(key) {
+    } else if ahead || used::known(key) {
         if let Some(q) = preload() {
             q.list.lock().unwrap().push_back(p);
             q.cv.notify_one();
@@ -583,6 +591,28 @@ mod used_tests {
     /// at once, with no budget, the build goes to the workers
     /// unwanted, and once built the bind gets the real one. Without `image_only` the same bind
     /// waits until the pipeline is built.
+    /// A pipeline submitted ahead (a big compute one the title binds later) is taken by a preload
+    /// worker and built without any bind; the later bind gets the real one.
+    #[test]
+    fn an_ahead_pipeline_is_built_without_a_bind() {
+        let standin = 0x7E57_B0A4usize;
+        let key = 0x7E57_5A5A_1234_5678u64;
+        let (built, built_rx) = mpsc::channel();
+        submit_ahead(standin, true, Box::new(move || {
+            let _ = built.send(());
+            0x5C5C
+        }), key);
+        built_rx.recv_timeout(std::time::Duration::from_secs(10)).expect("a preload worker picks it up without a bind");
+        let start = std::time::Instant::now();
+        while is_pending(standin) && start.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!is_pending(standin), "the ahead build completes");
+        assert_eq!(resolve_wait_for(standin, None), 0x5C5C, "the bind gets the built pipeline");
+        assert!(used::noted(key), "the bind records the shader key for the next run");
+        let _ = released(standin);
+    }
+
     #[test]
     fn a_bind_does_not_wait_for_a_pipeline_that_writes_only_images() {
         let (spared, waited) = (0x7E57_B0A1usize, 0x7E57_B0A2usize);
