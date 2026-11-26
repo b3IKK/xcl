@@ -312,17 +312,22 @@ pub unsafe fn forget(alloc: usize) {
 /// recording on it, or this is off). `Some(hr)`: done here – the PC allocator in use was put
 /// aside with its recordings and another one took its place.
 pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
+    title_reset_with(alloc, || {})
+}
+
+unsafe fn title_reset_with(alloc: *mut c_void, after_unlock: impl FnOnce()) -> Option<HRESULT> {
     if !enabled() {
         return None;
     }
     let mut g = STATE.lock().unwrap();
     let s = g.get_or_insert_with(State::default);
     let hr = title_reset_in(s, alloc, |raw| super::real::reset_pc_allocator(raw));
-    let free = free_aside(s);
+    // A backing can be reused as soon as STATE is unlocked. Detach its old recordings
+    // now so the sweep cannot remove recordings made by its next user.
+    let retired: Vec<_> = free_aside(s).filter_map(super::real::dispatch_chain::take_recordings).collect();
     drop(g);
-    for b in free {
-        super::real::dispatch_chain::allocator_reset(b);
-    }
+    after_unlock();
+    drop(retired);
     hr
 }
 
@@ -331,8 +336,8 @@ pub unsafe fn title_reset(alloc: *mut c_void) -> Option<HRESULT> {
 /// for takes one of them again, which may not come, so the scratch and commands that chained
 /// ExecuteIndirects kept with their recordings (`dispatch_chain::allocator_reset`) go now. Without
 /// this a title held 1,887 recordings under 48 allocators 110 s in, and memory grew until removal.
-unsafe fn free_aside(s: &State) -> Vec<usize> {
-    s.aside.values().flatten().copied().filter(|b| s.backings.get(b).is_none_or(|x| x.free())).collect()
+unsafe fn free_aside(s: &State) -> impl Iterator<Item = usize> + '_ {
+    s.aside.values().flatten().copied().filter(move |b| s.backings.get(b).is_none_or(|x| x.free()))
 }
 
 /// The allocator transition, with the PC Reset supplied so failure/retry needs no GPU in tests.
@@ -395,6 +400,55 @@ unsafe fn title_reset_in(s: &mut State, alloc: *mut c_void, mut reset: impl FnMu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aside_sweep_keeps_recordings_made_after_backing_reuse() {
+        use super::super::real::dispatch_chain::{allocator_reset, holds_recordings_for_test as holds, note_recordings_for_test as note};
+
+        let ids = Box::new([0u8; 6]);
+        let title = ids.as_ptr() as usize;
+        let (current, spare, old_list, new_list, trigger) = (title + 1, title + 2, title + 3, title + 4, title + 5);
+        let ty = D3D12_COMMAND_LIST_TYPE_DIRECT.0;
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.get_or_insert_with(State::default);
+            s.cur.insert(title, current);
+            s.aside.insert(title, vec![spare]);
+            s.types.insert(title, ty);
+            move_list(s, old_list, current);
+        }
+        note(spare);
+
+        // Pause the sweep after it unlocks and run reuse before it can finish retirement.
+        let hr = unsafe { title_reset_with(trigger as *mut c_void, || {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            let reused = title_reset_in(s, title as *mut c_void, |raw| {
+                assert_eq!(raw as usize, spare);
+                allocator_reset(spare); // what native allocator Reset does after success
+                0
+            });
+            assert_eq!(reused, Some(0));
+            move_list(s, new_list, spare);
+            note(spare);
+        }) };
+        let kept = holds(spare);
+
+        forget_list(old_list);
+        forget_list(new_list);
+        {
+            let mut g = STATE.lock().unwrap();
+            let s = g.as_mut().unwrap();
+            s.cur.remove(&title);
+            s.aside.remove(&title);
+            s.types.remove(&title);
+            s.backings.remove(&current);
+            s.backings.remove(&spare);
+        }
+        allocator_reset(spare);
+        assert_eq!(hr, None);
+        assert!(kept, "the earlier sweep erased the reused backing's new recording");
+    }
 
     #[test]
     fn a_spare_whose_reset_fails_stays_available_for_retry() {

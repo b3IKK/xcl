@@ -222,7 +222,7 @@ impl Drop for Scratch {
     }
 }
 
-struct Recording {
+pub(in crate::hle::d3d12x) struct Recording {
     scratch: Arc<Scratch>,
     first: ID3D12PipelineState,
     chain: Arc<Chain>,
@@ -340,9 +340,13 @@ unsafe fn scratch_for(dev: &ID3D12Device, list: usize, allocator: usize, needed:
     Some((s, false))
 }
 
+/// Take ownership without running recording readback or releasing COM objects under the lock.
+pub(in crate::hle::d3d12x) fn take_recordings(allocator: usize) -> Option<Vec<Arc<Recording>>> {
+    RECORDINGS.lock().unwrap().remove(&allocator)
+}
+
 pub(in crate::hle::d3d12x) fn allocator_reset(allocator: usize) {
-    let recordings = RECORDINGS.lock().unwrap().remove(&allocator);
-    drop(recordings);
+    drop(take_recordings(allocator));
 }
 
 #[cfg(test)]
